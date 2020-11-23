@@ -43,9 +43,9 @@ def generate_sentences():
                         word=instance['keyword'],
                         triggers=instance['triggers'])
 
-                # add these back into the instance
-                instance['generated'] = results
-                instance['forbidden_ids'] = forbidden_ids
+                    # add these back into the instance
+                    instance['generated'] = results
+                    instance['forbidden_ids'] = forbidden_ids
 
     # dump the generation
     with open('outs.yaml', 'w', encoding='utf-8') as file_:
