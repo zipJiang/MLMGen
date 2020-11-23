@@ -14,4 +14,4 @@ CONFIG_FILE_PATH=../yamls/examine_hidden_states.yaml
 DEVICE=cuda:1
 
 python3 generate_sentence_batches.py --num_samples_per_item ${SAMPLE_PER_ITEM}\
-    --device DEVICE --config_file CONFIG_FILE_PATH
+    --device ${DEVICE} --config_file ${CONFIG_FILE_PATH}
