@@ -30,6 +30,14 @@ class ConfigurationMLMSampler:
     top_k: int = field(default=100,
                        metadata={
                            'help': "sample from only top_k item."})
+    top_p: float = field(default=.92,
+                         metadata={
+                             'help': "Whether we use top_p for nucleus sampling."
+                         })
+    is_nucleus: bool = field(default=True,
+                             metadata={
+                                 'help': "Is nucleus sampling applied in the sampling?"
+                             })
     batch_size: int = field(default=32,
                             metadata={
                                 'help': "batch size to be used by sampler."})
@@ -52,7 +60,9 @@ class MLMSampler:
         self.burn_in_rounds = configuration.sampling_rounds
         self.tau = configuration.temperature
         self.top_k = configuration.top_k
+        self.top_p = configuration.top_p
         self.batch_size = configuration.batch_size
+        self.is_nucleus = configuration.is_nucleus
 
     def _sample_from_logits(self, logits: torch.Tensor,
                             top_k: Optional[int] = None)\
@@ -61,17 +71,39 @@ class MLMSampler:
         Notice that we are not using self.top_k but a passed-in argument top_k.
         """
         if top_k is not None:
-            lgt, ids = torch.topk(logits, k=top_k, dim=-1)
+            lgt, ids = torch.topk(logits / self.tau, k=top_k, dim=-1)
         else:
             lgt, _ = logits, None
 
-        samples = torch.multinomial(torch.softmax(lgt / self.tau, dim=-1),
+        samples = torch.multinomial(torch.softmax(lgt, dim=-1),
                                     num_samples=1,
                                     replacement=True)
         if top_k is not None:
             samples = torch.gather(ids, dim=-1, index=samples)
 
         # samples [batch_size]
+        return samples.squeeze(-1)
+
+    def _nucleus_sample_from_logits(self, logits: torch.Tensor,
+                                    top_p: Optional[float] = None) -> torch.LongTensor:
+        """Sample from top_p probability nucleus instead of
+        sample from full posterior dist.
+        """
+        if top_p is not None:
+            assert 0 < top_p and top_p < 1
+            logits, indices = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = torch.cumsum(logits, dim=-1)
+
+            masked_probs = torch.where(cum_probs > top_p, logits / self.tau, torch.ones_like(logits) * -1e8)
+        else:
+            masked_probs = logits
+
+        samples = torch.multinomial(torch.softmax(masked_probs, dim=-1),
+                                    num_samples=1, replacement=True)
+
+        if top_p is not None:
+            samples = torch.gather(indices, dim=-1, index=samples)
+
         return samples.squeeze(-1)
 
     def _generation_step(self, input_ids: torch.Tensor,
@@ -93,8 +125,12 @@ class MLMSampler:
         outputs = self.mlm_model(input_ids, attention_mask)
         logits = outputs.logits[iterative, pos]
 
-        samples = self._sample_from_logits(logits,
-                                           top_k=self.top_k if not burn_in else None)
+        if self.is_nucleus:
+            samples = self._nucleus_sample_from_logits(logits,
+                                                       top_p=self.top_p if not burn_in else None)
+        else:
+            samples = self._sample_from_logits(logits,
+                                               top_k=self.top_k if not burn_in else None)
         input_ids[iterative, pos] = samples
 
         return input_ids
@@ -114,6 +150,14 @@ class MLMSampler:
         texts = []
         forbidden_ids = []
 
+        # create a candidate list
+        candidates = set(range(self.tokenizer.vocab_size))
+        candidates -= set([self.tokenizer.mask_token_id,
+                           self.tokenizer.cls_token_id,
+                           self.tokenizer.sep_token_id,
+                           self.tokenizer.pad_token_id])
+        candidates = list(candidates)
+
         for length in lengths:
             random.shuffle(triggers)
             bag = [word_tknz]
@@ -126,7 +170,8 @@ class MLMSampler:
                 pointer += 1
 
             # now pack bag with [MASK]
-            bag.extend([[self.tokenizer.mask_token_id]] * (length - 3 - bag_size))
+            # we are not packing with mask tokens but random tokens.
+            bag.extend([random.sample(candidates, k=1) for i in range(length - 3 - bag_size)])
 
             id_iter = list(range(len(bag)))
             random.shuffle(id_iter)
@@ -260,8 +305,7 @@ if __name__ == '__main__':
     results, _ = sampler.sample_sentences(10, 'bank',
                                           #  triggers=['river', 'slope', 'water',
                                           #            'tree', 'grass'])
-                                          triggers=['money', 'check',
-                                                    'account', 'transaction'])
+                                          triggers=[])
 
     for sentence in results:
         print('-' * 20)
