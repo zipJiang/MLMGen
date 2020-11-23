@@ -159,6 +159,7 @@ class MLMSampler:
         candidates = list(candidates)
 
         for length in lengths:
+            length = length.cpu().item()
             random.shuffle(triggers)
             bag = [word_tknz]
             bag_size = len(word_tknz)

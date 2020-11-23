@@ -41,7 +41,7 @@ def generate_sentences():
                     results, forbidden_ids = sampler.sample_sentences(
                         args.num_samples,
                         word=instance['keyword'],
-                        triggers=instace['triggers'])
+                        triggers=instance['triggers'])
 
                 # add these back into the instance
                 instance['generated'] = results

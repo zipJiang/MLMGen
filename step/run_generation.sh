@@ -9,7 +9,7 @@ export PYTHONPATH=/mnt/nlp_swordfish/storage/proj/zj2265/MLMGen
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 
-SAMPLE_PER_ITEM=10
+SAMPLE_PER_ITEM=100
 CONFIG_FILE_PATH=../yamls/examine_hidden_states.yaml
 DEVICE=cuda:1
 
