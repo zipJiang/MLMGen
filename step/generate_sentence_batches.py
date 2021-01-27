@@ -31,7 +31,6 @@ def generate_sentences():
 
     # get a model
     model_config = ConfigurationMLMSampler(device=args.device)
-    print(model_config)
     sampler = MLMSampler(model_config, get_bert)
 
     with open(args.config_file, 'r', encoding='utf-8') as file_:
