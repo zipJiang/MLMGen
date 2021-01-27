@@ -19,7 +19,7 @@ class ConfigurationMLMSampler:
                                           metadata={
                                               'help': "range of generation excluding special tokens."})
     sampling_rounds: int = field(default=500,
-                                metadata={
+                                 metadata={
                                     'help': "number of gibbs round for generating sentences. (After mixed)."})
     burn_in_rounds: int = field(default=100,
                                 metadata={
@@ -63,7 +63,7 @@ class MLMSampler:
         if top_k is not None:
             lgt, ids = torch.topk(logits, k=top_k, dim=-1)
         else:
-            lgt, _ = logits, None
+            lgt = logits
 
         samples = torch.multinomial(torch.softmax(lgt / self.tau, dim=-1),
                                     num_samples=1,
@@ -86,7 +86,6 @@ class MLMSampler:
         input_ids, attention_mask: --- [batch_size, seq_len]
         pos: --- [batch_size]
         """
-        seq_len = input_ids.shape[-1]
         iterative = torch.arange(pos.shape[0]).long()
         input_ids[iterative, pos] = self.tokenizer.mask_token_id
 
@@ -135,7 +134,7 @@ class MLMSampler:
             for seq_id in id_iter:
                 if seq_id == 0:
                     #  print(self.tokenizer.convert_ids_to_tokens(bag[seq_id]))
-                    fbids = [len(text) + i for i in range(len(word_tknz))] + [0, length - 1, length - 2]
+                    fbids = [len(text) + i for i in range(len(word_tknz))] + [0, length.cpu().item() - 1, length.cpu().item() - 2]
                     forbidden_ids.append(fbids)
                 text.extend(bag[seq_id])
 

@@ -31,19 +31,22 @@ def generate_sentences():
 
     # get a model
     model_config = ConfigurationMLMSampler(device=args.device)
-    sampler = MLMSampler(config, get_bert)
+    print(model_config)
+    sampler = MLMSampler(model_config, get_bert)
 
     with open(args.config_file, 'r', encoding='utf-8') as file_:
         configuration = yaml.load(file_)
-        for instance in configuration['items']:
-            results, forbidden_ids = sampler.sample_sentences(
-                args.num_samples,
-                word=instance['keyword'],
-                triggers=instace['triggers'])
+        for keyword_list in configuration['items']:
+            for instance_list in keyword_list.values():
+                for instance in instance_list:
+                    results, forbidden_ids = sampler.sample_sentences(
+                        args.num_samples,
+                        word=instance['keyword'],
+                        triggers=instance['triggers'])
 
-            # add these back into the instance
-            instance['generated'] = results
-            instance['forbidden_ids'] = forbidden_ids
+                    # add these back into the instance
+                    instance['generated'] = results
+                    instance['forbidden_ids'] = forbidden_ids
 
     # dump the generation
     with open('outs.yaml', 'w', encoding='utf-8') as file_:
