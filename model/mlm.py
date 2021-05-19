@@ -2,6 +2,7 @@
 agnostic Gibbs sampler for the sentence generation task.
 """
 import transformers
+from transformers import AutoModelForMaskedLM, AutoTokenizer, PreTrainedTokenizerFast, PreTrainedModel
 from typing import Callable, Tuple, Dict, Optional, Text, List
 from dataclasses import dataclass, field
 import torch
@@ -9,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 import random
+from abc import ABC, abstractmethod
 
 
 @dataclass
@@ -34,81 +36,67 @@ class ConfigurationMLMSampler:
                          metadata={
                              'help': "Whether we use top_p for nucleus sampling."
                          })
-    is_nucleus: bool = field(default=True,
-                             metadata={
-                                 'help': "Is nucleus sampling applied in the sampling?"
-                             })
     batch_size: int = field(default=32,
                             metadata={
                                 'help': "batch size to be used by sampler."})
     device: Text = field(default='cuda:2',
                          metadata={'help': "Which device to use."})
-
-
-class MLMSampler:
+    ckpt_name: Text = field(default='bert-base-uncased',
+                            metadata={'help': 'Where to load the unline model'})
+    cache_dir: Text = field(default='cache/',
+                            metadata={'help': 'Where to store the downloaded model.'})
+    
+    
+class MLMSamplerBase(ABC):
+    """We are refactoring the generation script into OOP,
+    thus we need to define some base class object.
     """
-    """
-    def __init__(self, configuration: ConfigurationMLMSampler,
-                 model_config: Callable[[Text], Tuple]):
+    def __init__(self, configuration: ConfigurationMLMSampler):
         """We assume that for model the return_dict is set to 'True'
         """
-        self.device = configuration.device
-        self.mlm_model, self.tokenizer =\
-            model_config(device=self.device)
-        self.length_range = configuration.length_range
-        self.sampling_rounds = configuration.sampling_rounds
-        self.burn_in_rounds = configuration.sampling_rounds
-        self.tau = configuration.temperature
-        self.top_k = configuration.top_k
-        self.top_p = configuration.top_p
-        self.batch_size = configuration.batch_size
-        self.is_nucleus = configuration.is_nucleus
-
-    def _sample_from_logits(self, logits: torch.Tensor,
-                            top_k: Optional[int] = None)\
-            -> torch.LongTensor:
-        """Sample from top_k elements in a categorical distribution characterized by logits.
-        Notice that we are not using self.top_k but a passed-in argument top_k.
+        self.configuration = configuration
+        self.model, self.tokenizer = get_model(self.configuration.ckpt_name, self.configuration.device, self.configuration.cache_dir)
+        
+    def sample_sentences(self, num_samples: int,
+                         word: Text = ''):
         """
-        if top_k is not None:
-            lgt, ids = torch.topk(logits / self.tau, k=top_k, dim=-1)
-        else:
-            lgt = logits
-
-        samples = torch.multinomial(torch.softmax(lgt, dim=-1),
-                                    num_samples=1,
-                                    replacement=True)
-        if top_k is not None:
-            samples = torch.gather(ids, dim=-1, index=samples)
-
-        # samples [batch_size]
-        return samples.squeeze(-1)
-
-    def _nucleus_sample_from_logits(self, logits: torch.Tensor,
-                                    top_p: Optional[float] = None) -> torch.LongTensor:
-        """Sample from top_p probability nucleus instead of
-        sample from full posterior dist.
         """
-        if top_p is not None:
-            assert 0 < top_p and top_p < 1
-            logits, indices = torch.sort(logits, descending=True, dim=-1)
-            cum_probs = torch.cumsum(logits, dim=-1)
+        lengths = torch.randint(low=self.configuration.length_range[0],
+                                high=self.configuration.length_range[1],
+                                dtype=torch.int64, size=(num_samples,))
+        lengths = lengths.to(self.configuration.device)
+        # construct sentences of length in lengths with tokenizer.batch_encode_plus
+        token_ids, attention_mask, forbidden_ids = self._create_template(lengths, word)
 
-            masked_probs = torch.where(cum_probs > top_p, logits / self.tau, torch.ones_like(logits) * -1e8)
-        else:
-            masked_probs = logits
+        decoded_sentences = []
 
-        samples = torch.multinomial(torch.softmax(masked_probs, dim=-1),
-                                    num_samples=1, replacement=True)
+        # first iterate through batches:
+        for i in tqdm(range(0, num_samples, self.configuration.batch_size)):
+            batch_input, batch_mask = token_ids[i:i + self.configuration.batch_size],\
+                attention_mask[i:i + self.configuration.batch_size]
+            batch_lengths = lengths[i:i + self.configuration.batch_size]
 
-        if top_p is not None:
-            samples = torch.gather(indices, dim=-1, index=samples)
+            fbids = forbidden_ids[i: i + self.configuration.batch_size]
 
-        return samples.squeeze(-1)
+            for ridx in range(self.configuration.sampling_rounds):
+                pos = self._sample_pos(batch_lengths, fbids)
+                batch_input = self._generation_step(batch_input,
+                                                    batch_mask,
+                                                    pos,
+                                                    burn_in=ridx < self.configuration.burn_in_rounds)
 
+            # after the sampling, do decoding
+            decoded = self.tokenizer.batch_decode(batch_input.cpu().tolist(),
+                                                  skip_special_tokens=True,
+                                                  clean_up_tokenization_spaces=True)
+
+            decoded_sentences.extend(decoded)
+
+        return decoded_sentences
+    
     def _generation_step(self, input_ids: torch.Tensor,
+                         attention_mask: torch.Tensor,
                          pos: torch.Tensor,
-                         attention_mask: Optional[torch.Tensor] = None,
                          burn_in: bool = False):
         """Can access masked tokens as self.tokenizer.mask_token,
         self.tokenizer.cls_token, self.tokenizer.sep_token.
@@ -118,92 +106,129 @@ class MLMSampler:
         input_ids, attention_mask: --- [batch_size, seq_len]
         pos: --- [batch_size]
         """
-        iterative = torch.arange(pos.shape[0]).long()
-        input_ids[iterative, pos] = self.tokenizer.mask_token_id
+        # iterative = torch.arange(pos.shape[0]).long()
+        # input_ids[iterative, pos] = self.tokenizer.mask_token_id
+        # outputs = self.mlm_model(input_ids, attention_mask)
+        # logits = outputs.logits[iterative, pos]
+        
+        with torch.no_grad():
+            
+            logits = self._get_logits(input_ids, attention_mask, pos)
+            samples = self._sample_from_logits(logits, burn_in=burn_in)
+            
+        return self._gather_preds(input_ids, samples, pos)
 
-        outputs = self.mlm_model(input_ids, attention_mask)
-        logits = outputs.logits[iterative, pos]
+    @abstractmethod
+    def _create_template(self, lengths: torch.Tensor,
+                         word: Text) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        """return:
+            [TEMPLATE_TENSOR, ATTENTION_MASK, FORBIDDEN_IDS]
+        """
+        pass
+    
+    @abstractmethod
+    def _get_logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Returns the logits of the given positions.
+        """
+        pass
+    
+    @abstractmethod
+    def _gather_preds(self, input_ids: torch.Tensor, samples: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Gather model prediction and generate final output of this step.
+        """
+        pass
 
-        if self.is_nucleus:
-            samples = self._nucleus_sample_from_logits(logits,
-                                                       top_p=self.top_p if not burn_in else None)
+    def _sample_pos(self, lengths: torch.Tensor, fbids: List[int]) -> torch.Tensor:
+        """Sample prediction positions for the sentence tensors.
+        """
+        pass
+
+    def _sample_from_logits(self, logits: torch.Tensor, burn_in: bool) -> torch.Tensor:
+        """Given positional logits and sample final predictions.
+        """
+        pass
+
+
+class SimpleMLMSampler(MLMSamplerBase):
+    """This function is a Sampler without any additional features.
+    """
+    def __init__(self, configuration: ConfigurationMLMSampler):
+        """In our model we will use top_k, batch_size, etc.
+        """
+        super().__init__(configuration)
+
+
+    def _sample_from_logits(self, logits: torch.Tensor,
+                            burn_in: Optional[bool])\
+            -> torch.Tensor:
+        """The difference compared with previous implementation is
+        that we now will by default use the top_k setted during initialization.
+        """
+        if not burn_in:
+            lgt, ids = torch.topk(logits / self.configuration.temperature, k=self.configuration.top_k, dim=-1)
         else:
-            samples = self._sample_from_logits(logits,
-                                               top_k=self.top_k if not burn_in else None)
-        input_ids[iterative, pos] = samples
+            lgt = logits
 
-        return input_ids
+        # samples = torch.multinomial(torch.softmax(lgt, dim=-1),
+        #                             num_samples=1,
+        #                             replacement=True)
+        sampler = torch.distributions.categorical.Categorical(logits=lgt)
+        samples = sampler.sample()
+        samples = samples.unsqueeze(-1)
+        
+        if not burn_in:
+            samples = torch.gather(ids, dim=-1, index=samples)
+
+        # samples [batch_size]
+        return samples.squeeze(-1)
 
     def _create_template(self, lengths: torch.Tensor,
-                         word: Text = '', triggers: List[Text] = []):
-        """This function create template with padding and attention_mask.
-        We use triggers to ground word meaning.
+                         word: Text = ''):
+        """
         """
 
-        # we first need to tokenize triggers.
-        triggers = [self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(wd))
-                    for wd in triggers]
         word_tknz = self.tokenizer.convert_tokens_to_ids(
             self.tokenizer.tokenize(word))
-
-        texts = []
-        forbidden_ids = []
+        word_tknz = torch.tensor(word_tknz, dtype=torch.int64)
 
         # create a candidate list
-        candidates = set(range(self.tokenizer.vocab_size))
-        candidates -= set([self.tokenizer.mask_token_id,
-                           self.tokenizer.cls_token_id,
-                           self.tokenizer.sep_token_id,
-                           self.tokenizer.pad_token_id])
-        candidates = list(candidates)
+        template = torch.zeros(lengths.shape[0], self.configuration.length_range[1],
+                               dtype=torch.int64)
+        template.fill_(self.tokenizer.mask_token_id)
+        forbidden_mask = torch.ones(lengths.shape[0], self.configuration.length_range[1],
+                                    dtype=torch.float32)
 
-        for length in lengths:
-            length = length.cpu().item()
-            random.shuffle(triggers)
-            bag = [word_tknz]
-            bag_size = len(word_tknz)
-            pointer = 0
+        pos_word_begin = self._sample_pos(lengths - len(word_tknz))
+        
+        # TODO: change forbidden_ids into a mask might be better.
+        for lidx, (length, pb) in enumerate(zip(lengths, pos_word_begin)):
+            # sample sentence one-by-one
+            template[lidx, 0] = self.tokenizer.cls_token_id
+            template[lidx, length - 1] = self.tokenizer.sep_token_id
+            template[lidx, length:] = self.tokenizer.pad_token_id
+            template[lidx, pb:pb + len(word_tknz)] = word_tknz
+            forbidden_mask[lidx, pb:pb + len(word_tknz)] = 0.
+            forbidden_mask[lidx, 0] = 0.
+            forbidden_mask[lidx, length - 1] = 0.
+            
+        print(template)
+            
+        attention_mask = torch.ones_like(template)
+        attention_mask.masked_fill_(template == self.tokenizer.pad_token_id, 0)
+            
+        return template.to(self.configuration.device), attention_mask.to(self.configuration.device), forbidden_mask.to(self.configuration.device)
 
-            while bag_size <= length - 3 and pointer != len(triggers):
-                bag.append(triggers[pointer])
-                bag_size += len(triggers[pointer])
-                pointer += 1
-
-            # now pack bag with [MASK]
-            # we are not packing with mask tokens but random tokens.
-            bag.extend([random.sample(candidates, k=1) for i in range(length - 3 - bag_size)])
-
-            id_iter = list(range(len(bag)))
-            random.shuffle(id_iter)
-
-            text = [self.tokenizer.cls_token_id]
-            for seq_id in id_iter:
-                if seq_id == 0:
-                    #  print(self.tokenizer.convert_ids_to_tokens(bag[seq_id]))
-                    fbids = [len(text) + i for i in range(len(word_tknz))] + [0, length.cpu().item() - 1, length.cpu().item() - 2]
-                    forbidden_ids.append(fbids)
-                text.extend(bag[seq_id])
-
-            texts.append((text + self.tokenizer.convert_tokens_to_ids(['.'])
-                          + [self.tokenizer.sep_token_id]
-                          + [self.tokenizer.pad_token_id] * self.length_range[1])[:self.length_range[1]])
-
-        # construct input_ids and attention_mask
-        input_ids = torch.tensor(texts, dtype=torch.int64)
-        attention_mask = torch.where(input_ids != self.tokenizer.pad_token_id,
-                                     torch.ones_like(input_ids), torch.zeros_like(input_ids))
-
-        return {'input_ids': input_ids,
-                'attention_mask': attention_mask}, forbidden_ids
-
-    def _sample_pos(self, lengths: torch.Tensor, forbidden: Optional[List[List[int]]] = None):
+    def _sample_pos(self, lengths: torch.Tensor, forbidden: Optional[torch.Tensor] = None):
         """Sample a position to be updated
         """
-        categorical = torch.ones((lengths.shape[0], torch.max(lengths)), dtype=torch.float32)
+        categorical = torch.ones((lengths.shape[0], self.configuration.length_range[1]),
+                                 dtype=torch.float32)
+        categorical = categorical.to(self.configuration.device)
+
         for i, length in enumerate(lengths):
             categorical[i, length:] = 0.
             if forbidden is not None:
-                categorical[i, forbidden[i]] = 0.
+                categorical = categorical * forbidden
 
         # renormalize categorical
         categorical /= torch.sum(categorical, dim=-1, keepdim=True)
@@ -211,103 +236,51 @@ class MLMSampler:
                                 replacement=True)
 
         # pos [batch_size]
-        return pos.squeeze(-1)
-
-    def sample_sentences(self, num_samples: int,
-                         word: Text = '', triggers: List[Text] = []):
+        
+        return pos.squeeze(-1).to(self.configuration.device)
+    
+    def _get_logits(self, input_ids: torch.Tensor,
+                    attention_mask: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """This function gather the logits at given location.
         """
+        iterator = torch.arange(0, input_ids.shape[0])
+        
+        outputs = self.model(input_ids, attention_mask)
+        logits = outputs.logits
+        logits = logits[iterator, pos]
+
+        return logits  # of shape [self.batch_size, num_logits]
+
+    def _gather_preds(self, input_ids: torch.Tensor, samples: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+        """Function for gathering the precdiction for samples.
+        
+        samples: [self.configuration.batch_size]
+        input_ids: [self.configuration.batch_size, seq_len]
+        pos: [self.configuration.batch_size]
         """
-        lengths = torch.randint(low=self.length_range[0], high=self.length_range[1], dtype=torch.int64, size=(num_samples,))
-        # construct sentences of length in lengths with tokenizer.batch_encode_plus
-        tokenized, forbidden_ids = self._create_template(lengths, word, triggers)
-
-        decoded_sentences = []
-
-        # first iterate through batches:
-        for i in tqdm(range(0, num_samples, self.batch_size)):
-            batch_input, batch_mask = tokenized['input_ids'][i:i + self.batch_size].to(self.device),\
-                tokenized['attention_mask'][i:i + self.batch_size].to(self.device)
-            batch_lengths = lengths[i:i + self.batch_size]
-
-            fbids = forbidden_ids[i: i + self.batch_size]
-
-            for ridx in range(self.sampling_rounds):
-                pos = self._sample_pos(batch_lengths, fbids)
-                batch_input = self._generation_step(batch_input, pos,
-                                                    batch_mask,
-                                                    burn_in=ridx < self.burn_in_rounds)
-
-            # after the sampling, do decoding
-            decoded = self.tokenizer.batch_decode(batch_input.cpu().tolist(),
-                                                  skip_special_tokens=True,
-                                                  clean_up_tokenization_spaces=True)
-
-            decoded_sentences.extend(decoded)
-
-        return decoded_sentences, forbidden_ids
+        
+        iterator = torch.arange(0, input_ids.shape[0])
+        input_ids[iterator, pos] = samples
+        
+        return input_ids
 
 
-def get_roberta(device: Text):
-    """This is the classical function for getting a automodel.
+MODEL_NAME_DICT = {
+    'bert': 'bert-base-uncased',
+    'electra': 'google/electra-large-generator'
+}
 
-    Notice that pre_tokenized and there is a bug for adding space. We have to concatenate it and do sampling again for BPE.
+    
+def get_model(model_name: Text,
+              device: Text,
+              cache_dir: Text) -> Tuple[PreTrainedModel, PreTrainedTokenizerFast]:
+    """This function will get us a model of
+    the model to be used for the function.
     """
-    model = transformers.RobertaForMaskedLM.from_pretrained('roberta-base',
-                                                            return_dict=True)
-    model_config = transformers.RobertaConfig.from_pretrained('roberta-base')
-    model.lm_head.decoder.bias = torch.nn.Parameter(torch.zeros(model_config.vocab_size))
-    #  config = transformers.RObertaConfig.from_pretrained('roberta-base')
-    tokenizer = transformers.RobertaTokenizerFast.from_pretrained(
-        #  'roberta-base', add_prefix_space=True)
-        'roberta-base')
-
+    model = AutoModelForMaskedLM.from_pretrained(model_name, cache_dir=cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+    
     model.to(device)
     model.eval()
-
+    
     return model, tokenizer
-
-
-def get_bert(device: Text):
-    model = transformers.BertForMaskedLM.from_pretrained('bert-base-uncased',
-                                                         return_dict=True)
-    model_config = transformers.BertConfig.from_pretrained('bert-base-uncased')
-    #  model.cls.predictions.decoder.bias = torch.nn.Parameter(torch.zeros(model_config.vocab_size))
-    #  config = transformers.RObertaConfig.from_pretrained('roberta-base')
-    tokenizer = transformers.BertTokenizerFast.from_pretrained(
-        'bert-base-uncased')
-
-    model.to(device)
-    model.eval()
-
-    return model, tokenizer
-
-
-def get_electra(device: Text):
-    model = transformers.ElectraForMaskedLM.from_pretrained('google/electra-large-generator', return_dict=True)
-    model_config = transformers.ElectraConfig.from_pretrained('google/electra-large-generator')
-    #  model.cls.predictions.decoder.bias = torch.nn.Parameter(torch.zeros(model_config.vocab_size))
-    #  config = transformers.RObertaConfig.from_pretrained('roberta-base')
-    tokenizer = transformers.ElectraTokenizerFast.from_pretrained(
-        'google/electra-large-generator')
-
-    model.to(device)
-    model.eval()
-
-    return model, tokenizer
-
-
-if __name__ == '__main__':
-    """Simple test for functionality.
-    """
-    config = ConfigurationMLMSampler()
-
-    sampler = MLMSampler(config, get_bert)
-    results, _ = sampler.sample_sentences(10, 'bank',
-                                          #  triggers=['river', 'slope', 'water',
-                                          #            'tree', 'grass'])
-                                          triggers=[])
-
-    for sentence in results:
-        print('-' * 20)
-        print(sentence)
-        print('-' * 20)

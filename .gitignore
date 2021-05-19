@@ -1,2 +1,4 @@
 mdl/
 *.py[co]
+.env/
+cache/
