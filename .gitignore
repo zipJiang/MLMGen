@@ -2,3 +2,7 @@ mdl/
 *.py[co]
 .env/
 cache/
+fudge_ckpt/
+generative_data/
+test_data/
+*__pycache__/
